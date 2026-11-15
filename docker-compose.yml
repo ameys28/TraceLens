@@ -1,0 +1,197 @@
+# TraceLens — full local stack
+#   docker compose up --build          -> everything (demo services + platform + UI + traffic)
+#   docker compose --profile load run --rm k6-load   -> ingestion load test
+#
+# Host ports
+#   3000  UI                 8080  platform API          8081  demo gateway
+#   4317/4318  OTel Collector 5433  Postgres (host)       6380  Redis (host)   29092 Kafka (host)
+
+x-demo-service: &demo-service
+  build: ./demo-services
+  image: tracelens/demo-services:latest
+  restart: unless-stopped
+  depends_on:
+    otel-collector:
+      condition: service_started
+    kafka:
+      condition: service_healthy
+  environment: &demo-env
+    JAVA_TOOL_OPTIONS: "-javaagent:/app/opentelemetry-javaagent.jar -Xms64m -Xmx128m -XX:+UseSerialGC -XX:TieredStopAtLevel=1"
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    OTEL_PROPAGATORS: tracecontext,baggage
+    # Head sampling (SDK side). 1.0 = send everything; TraceLens then tail-samples.
+    OTEL_TRACES_SAMPLER: parentbased_traceidratio
+    OTEL_TRACES_SAMPLER_ARG: "1.0"
+    OTEL_METRICS_EXPORTER: none
+    OTEL_LOGS_EXPORTER: none
+    OTEL_BSP_SCHEDULE_DELAY: "500"
+    SPRING_KAFKA_BOOTSTRAPSERVERS: kafka:9092
+    DEMO_URLS_ORDER: http://order-service:8080
+    DEMO_URLS_INVENTORY: http://inventory-service:8080
+    DEMO_URLS_PAYMENT: http://payment-service:8080
+  mem_limit: 384m
+
+services:
+  # ---------------------------------------------------------------- infrastructure
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tracelens
+      POSTGRES_USER: tracelens
+      POSTGRES_PASSWORD: tracelens
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracelens -d tracelens"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 160m
+
+  kafka:
+    image: apache/kafka:3.8.1
+    restart: unless-stopped
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 6
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    mem_limit: 640m
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.114.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["./infra/otel-collector.yaml:/etc/otelcol/config.yaml:ro"]
+    ports: ["4317:4317", "4318:4318"]
+    depends_on: [platform]
+    mem_limit: 192m
+
+  # ---------------------------------------------------------------- TraceLens platform
+  platform:
+    build: ./platform
+    image: tracelens/platform:latest
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms128m -Xmx384m -XX:+UseG1GC"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/tracelens
+      SPRING_DATASOURCE_USERNAME: tracelens
+      SPRING_DATASOURCE_PASSWORD: tracelens
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_KAFKA_BOOTSTRAPSERVERS: kafka:9092
+      TRACELENS_SAMPLING_DECISIONWAITMS: "10000"
+      TRACELENS_SAMPLING_BASELINERATE: "0.10"
+      TRACELENS_SAMPLING_DEFAULTSLOWTHRESHOLDMS: "500"
+      TRACELENS_RETENTIONDAYS: "7"
+      # Optional: Slack-compatible incoming webhook for alerts
+      TRACELENS_ALERTING_WEBHOOKURL: ""
+    mem_limit: 640m
+
+  ui:
+    build: ./ui
+    image: tracelens/ui:latest
+    restart: unless-stopped
+    ports: ["3000:80"]
+    depends_on: [platform]
+    mem_limit: 64m
+
+  # ---------------------------------------------------------------- demo system (traced)
+  gateway:
+    <<: *demo-service
+    ports: ["8081:8080"]
+    environment:
+      <<: *demo-env
+      OTEL_SERVICE_NAME: gateway
+      DEMO_ROLE: gateway
+
+  order-service:
+    <<: *demo-service
+    environment:
+      <<: *demo-env
+      OTEL_SERVICE_NAME: order-service
+      DEMO_ROLE: order
+
+  inventory-service:
+    <<: *demo-service
+    environment:
+      <<: *demo-env
+      OTEL_SERVICE_NAME: inventory-service
+      DEMO_ROLE: inventory
+
+  payment-service:
+    <<: *demo-service
+    environment:
+      <<: *demo-env
+      OTEL_SERVICE_NAME: payment-service
+      DEMO_ROLE: payment
+
+  notification-service:
+    <<: *demo-service
+    environment:
+      <<: *demo-env
+      OTEL_SERVICE_NAME: notification-service
+      DEMO_ROLE: notification
+
+  # Steady background traffic so the UI always has data (≈5 req/s).
+  traffic:
+    image: grafana/k6:0.55.0
+    restart: unless-stopped
+    command: ["run", "--quiet", "/scripts/traffic.js"]
+    environment:
+      GATEWAY_URL: http://gateway:8080
+      RATE: "5"
+    volumes: ["./k6:/scripts:ro"]
+    depends_on: [gateway]
+    mem_limit: 128m
+
+  # ---------------------------------------------------------------- on-demand
+  k6-load:
+    image: grafana/k6:0.55.0
+    profiles: ["load"]
+    command: ["run", "/scripts/ingest-load-test.js"]
+    environment:
+      PLATFORM_URL: http://platform:8080
+    volumes: ["./k6:/scripts:ro"]
+    depends_on: [platform]
+
+volumes:
+  pgdata:

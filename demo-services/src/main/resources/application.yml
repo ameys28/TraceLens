@@ -1,0 +1,32 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: ${DEMO_ROLE:gateway}
+  kafka:
+    bootstrap-servers: localhost:29092
+    consumer:
+      auto-offset-reset: latest
+    producer:
+      acks: 1
+
+demo:
+  role: gateway
+  urls:
+    order: http://localhost:8082
+    inventory: http://localhost:8083
+    payment: http://localhost:8084
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+# trace_id / span_id are put in the MDC by the OpenTelemetry agent; correlationId by our filter.
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [${spring.application.name}] trace=%X{trace_id:-} span=%X{span_id:-} corr=%X{correlationId:-} %logger{24} - %msg%n"
+  level:
+    org.apache.kafka: WARN
