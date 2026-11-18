@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body { font-family: theme('fontFamily.sans'); }
+  ::selection { background: #f5a52455; }
+}
+@layer components {
+  .panel { @apply rounded-lg border border-ink-800 bg-ink-900; }
+  .label { @apply text-[11px] font-medium uppercase tracking-wider text-ink-500; }
+  .input { @apply rounded-md border border-ink-700 bg-ink-850 px-2.5 py-1.5 text-sm text-ink-100 outline-none focus:border-signal; }
+  .btn { @apply rounded-md border border-ink-700 bg-ink-850 px-3 py-1.5 text-sm text-ink-100 hover:border-ink-500 disabled:opacity-40; }
+  .btn-primary { @apply rounded-md bg-signal px-3 py-1.5 text-sm font-medium text-ink-950 hover:brightness-110; }
+  .th { @apply px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider text-ink-500; }
+  .td { @apply border-t border-ink-800 px-3 py-2 text-sm; }
+  .mono { font-family: theme('fontFamily.mono'); }
+}
+.react-flow__attribution { display: none; }
